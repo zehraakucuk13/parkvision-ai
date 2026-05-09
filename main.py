@@ -1,84 +1,41 @@
 import cv2
-import matplotlib.pyplot as plt
-import numpy as np
 
-from util import get_parking_spots_bboxes, empty_or_not
-
-
-def calc_diff(im1, im2):
-    return np.abs(np.mean(im1) - np.mean(im2))
+from detector import ParkingDetector
+from vehicle_tracker import ParkingVehicleTracker
 
 
-mask = './mask_1920_1080.png'
-video_path = './samples/parking_1920_1080_loop.mp4'
+MASK_PATH = "./mask_1920_1080.png"
+VIDEO_PATH = "./samples/parking_1920_1080.mp4"
+ROI = (260, 419, 1200, 1040)
 
 
-mask = cv2.imread(mask, 0)
+def main():
+    detector = ParkingDetector(MASK_PATH, step=30, roi=ROI)
+    vehicle_tracker = ParkingVehicleTracker()
+    spot_boxes = dict(zip(detector.spot_ids, detector.spots))
+    cap = cv2.VideoCapture(VIDEO_PATH)
 
-cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"Video could not be opened: {VIDEO_PATH}")
 
-connected_components = cv2.connectedComponentsWithStats(mask, 4, cv2.CV_32S)
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
 
-spots = get_parking_spots_bboxes(connected_components)
+        annotated, statuses = detector.process(frame)
+        vehicle_tracker.update(statuses, spot_boxes, annotated, detector.diff_by_spot_id)
+        annotated = detector.draw_spots(annotated)
+        annotated = vehicle_tracker.draw(annotated, spot_boxes)
 
-spots_status = [None for j in spots]
-diffs = [None for j in spots]
+        cv2.namedWindow("ParkVision AI", cv2.WINDOW_NORMAL)
+        cv2.imshow("ParkVision AI", annotated)
+        if cv2.waitKey(25) & 0xFF == ord("q"):
+            break
 
-previous_frame = None
+    cap.release()
+    cv2.destroyAllWindows()
 
-frame_nmr = 0
-ret = True
-step = 30
-while ret:
-    ret, frame = cap.read()
 
-    if frame_nmr % step == 0 and previous_frame is not None:
-        for spot_indx, spot in enumerate(spots):
-            x1, y1, w, h = spot
-
-            spot_crop = frame[y1:y1 + h, x1:x1 + w, :]
-
-            diffs[spot_indx] = calc_diff(spot_crop, previous_frame[y1:y1 + h, x1:x1 + w, :])
-
-        print([diffs[j] for j in np.argsort(diffs)][::-1])
-
-    if frame_nmr % step == 0:
-        if previous_frame is None:
-            arr_ = range(len(spots))
-        else:
-            arr_ = [j for j in np.argsort(diffs) if diffs[j] / np.amax(diffs) > 0.4]
-        for spot_indx in arr_:
-            spot = spots[spot_indx]
-            x1, y1, w, h = spot
-
-            spot_crop = frame[y1:y1 + h, x1:x1 + w, :]
-
-            spot_status = empty_or_not(spot_crop)
-
-            spots_status[spot_indx] = spot_status
-
-    if frame_nmr % step == 0:
-        previous_frame = frame.copy()
-
-    for spot_indx, spot in enumerate(spots):
-        spot_status = spots_status[spot_indx]
-        x1, y1, w, h = spots[spot_indx]
-
-        if spot_status:
-            frame = cv2.rectangle(frame, (x1, y1), (x1 + w, y1 + h), (0, 255, 0), 2)
-        else:
-            frame = cv2.rectangle(frame, (x1, y1), (x1 + w, y1 + h), (0, 0, 255), 2)
-
-    cv2.rectangle(frame, (80, 20), (550, 80), (0, 0, 0), -1)
-    cv2.putText(frame, 'Available spots: {} / {}'.format(str(sum(spots_status)), str(len(spots_status))), (100, 60),
-                cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-
-    cv2.namedWindow('frame', cv2.WINDOW_NORMAL)
-    cv2.imshow('frame', frame)
-    if cv2.waitKey(25) & 0xFF == ord('q'):
-        break
-
-    frame_nmr += 1
-
-cap.release()
-cv2.destroyAllWindows()
+if __name__ == "__main__":
+    main()

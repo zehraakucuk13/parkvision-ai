@@ -1,3 +1,4 @@
+from pathlib import Path
 import pickle
 
 from skimage.transform import resize
@@ -8,7 +9,8 @@ import cv2
 EMPTY = True
 NOT_EMPTY = False
 
-MODEL = pickle.load(open("model.p", "rb"))
+BASE_DIR = Path(__file__).resolve().parent
+MODEL = pickle.load(open(BASE_DIR / "model.p", "rb"))
 
 
 def empty_or_not(spot_bgr):
@@ -21,7 +23,7 @@ def empty_or_not(spot_bgr):
 
     y_output = MODEL.predict(flat_data)
 
-    if y_output == 0:
+    if int(y_output[0]) == 0:
         return EMPTY
     else:
         return NOT_EMPTY
