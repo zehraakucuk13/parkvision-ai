@@ -7,6 +7,7 @@ import cv2
 import pandas as pd
 import streamlit as st
 
+from database import upsert_slots
 from detector import ParkingDetector
 from parking_sessions import ParkingSessionManager
 from vehicle_tracker import ParkingVehicleTracker
@@ -32,11 +33,13 @@ def main():
     st.set_page_config(page_title="ParkVision AI", layout="wide")
     inject_theme()
     st.title("ParkVision AI")
+
     st.session_state.setdefault("demo_finished", False)
     st.session_state.setdefault("demo_user_ready", False)
     st.session_state.setdefault("screen", "entry")
     if "default_entry_time" not in st.session_state:
         st.session_state.default_entry_time = datetime.now() - timedelta(minutes=random.randint(35, 125))
+
     session_manager = get_session_manager()
 
     if st.session_state.screen == "payment":
@@ -52,12 +55,9 @@ def main():
         st.session_state.demo_customer_name,
         st.session_state.demo_started_at,
     )
-    video_path = str(DEFAULT_VIDEO_PATH)
-    mask_path = str(DEFAULT_MASK_PATH)
-    speed = DEFAULT_SPEED
 
     with st.sidebar:
-        run = st.toggle("Start live demo", value=False)
+        run = st.toggle("Canlı demoyu başlat", value=False)
 
     video_col, info_col = st.columns([2.2, 1])
     frame_slot = video_col.empty()
@@ -66,18 +66,20 @@ def main():
 
     if not run:
         st.session_state.demo_finished = False
-        st.info("Start the demo to assign temporary IDs to parked vehicles and track exiting vehicles with the same ID.")
+        st.info("Park doluluğunu algılamak, oturumları kaydetmek ve ödeme kayıtlarını güncellemek için demoyu başlatın.")
         render_parking_product(session_manager)
         return
 
     if st.session_state.demo_finished:
-        st.info("Video ended.")
+        st.info("Video bitti.")
         render_parking_product(session_manager)
         return
 
-    detector = ParkingDetector(mask_path, step=1, roi=ROI)
+    detector = ParkingDetector(str(DEFAULT_MASK_PATH), step=1, roi=ROI)
     vehicle_tracker = ParkingVehicleTracker()
     spot_boxes = dict(zip(detector.spot_ids, detector.spots))
+    upsert_slots(spot_boxes)
+
     frame_index = 0
     last_annotated = None
     last_statuses = detector.status_dict
@@ -88,6 +90,7 @@ def main():
         occupied = total - empty
         entries = len(vehicle_tracker.entry_vehicle_ids)
         exits = len(vehicle_tracker.exiting_tracks) + len(vehicle_tracker.completed_vehicle_ids)
+
         session_manager.sync(
             vehicle_tracker.parked_vehicle_ids,
             vehicle_tracker.entry_vehicle_ids,
@@ -96,19 +99,25 @@ def main():
 
         with metric_slot.container():
             cols = st.columns(2)
-            cols[0].metric("Available", empty)
-            cols[1].metric("Occupied", occupied)
-            cols[0].metric("Entries", entries)
-            cols[1].metric("Exits", exits)
+            cols[0].metric("Boş", empty)
+            cols[1].metric("Dolu", occupied)
+            cols[0].metric("Giriş", entries)
+            cols[1].metric("Çıkış", exits)
 
-        vehicle_slot.dataframe(pd.DataFrame(vehicle_tracker.rows()), use_container_width=True, hide_index=True)
+        vehicle_rows = vehicle_tracker.rows()
+        if vehicle_rows:
+            vehicle_slot.dataframe(pd.DataFrame(vehicle_rows), use_container_width=True, hide_index=True)
+        else:
+            vehicle_slot.info("Henüz araç hareketi yok.")
 
-    cap = cv2.VideoCapture(video_path)
+    cap = cv2.VideoCapture(str(DEFAULT_VIDEO_PATH))
     if not cap.isOpened():
-        st.error(f"Video could not be opened: {video_path}")
+        st.error(f"Video açılamadı: {DEFAULT_VIDEO_PATH}")
+        render_parking_product(session_manager)
         return
+
     fps = cap.get(cv2.CAP_PROP_FPS) or 30
-    frame_delay = 1 / (fps * speed)
+    frame_delay = 1 / (fps * DEFAULT_SPEED)
 
     while run:
         ok, frame = cap.read()
@@ -116,9 +125,9 @@ def main():
             vehicle_tracker.complete_exiting_tracks()
             st.session_state.demo_finished = True
             if last_annotated is not None:
-                frame_slot.image(last_annotated, channels="RGB", use_column_width=True)
+                frame_slot.image(last_annotated, channels="RGB", width="stretch")
             render_side_panel(last_statuses)
-            st.info("Video ended.")
+            st.info("Video bitti.")
             time.sleep(END_HOLD_SECONDS)
             break
 
@@ -128,24 +137,26 @@ def main():
         annotated = detector.draw_spots(annotated)
         annotated = vehicle_tracker.draw(annotated, spot_boxes)
         annotated = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
+
         if annotated.shape[1] > DISPLAY_WIDTH:
             display_height = int(annotated.shape[0] * DISPLAY_WIDTH / annotated.shape[1])
             annotated = cv2.resize(annotated, (DISPLAY_WIDTH, display_height), interpolation=cv2.INTER_AREA)
+
         last_annotated = annotated
-        frame_slot.image(annotated, channels="RGB", use_column_width=True)
+        frame_slot.image(annotated, channels="RGB", width="stretch")
 
         if frame_index % PANEL_UPDATE_EVERY_FRAMES == 0:
             render_side_panel(statuses)
 
-        for _ in range(speed - 1):
+        for _ in range(DEFAULT_SPEED - 1):
             ok, _ = cap.read()
             if not ok:
                 vehicle_tracker.complete_exiting_tracks()
                 st.session_state.demo_finished = True
                 if last_annotated is not None:
-                    frame_slot.image(last_annotated, channels="RGB", use_column_width=True)
+                    frame_slot.image(last_annotated, channels="RGB", width="stretch")
                 render_side_panel(last_statuses)
-                st.info("Video ended.")
+                st.info("Video bitti.")
                 time.sleep(END_HOLD_SECONDS)
                 run = False
                 break
@@ -158,26 +169,26 @@ def main():
 
 
 def render_entry_gate(session_manager: ParkingSessionManager):
-    st.subheader("User Check-In")
-    st.caption("Get your vehicle ID from the QR/ticket screen, confirm your entry time, and continue to the system.")
+    st.subheader("Kullanıcı Girişi")
+    st.caption("Araç ID'nizi giriş fişi/QR ekranından alın, giriş saatinizi onaylayın ve sisteme devam edin.")
 
     default_started_at = st.session_state.default_entry_time
-    vehicle_id = st.selectbox("Vehicle ID", ["V-0077"], index=0)
-    customer_name = st.text_input("Name / phone", value="Demo User")
-    entry_time = st.time_input("Parking entry time", value=default_started_at.time().replace(second=0, microsecond=0))
+    vehicle_id = st.selectbox("Araç ID", ["V-0077"], index=0)
+    customer_name = st.text_input("Ad / telefon", value="Demo Kullanıcı")
+    entry_time = st.time_input("Park giriş saati", value=default_started_at.time().replace(second=0, microsecond=0))
     started_at = datetime.combine(datetime.now().date(), entry_time)
     if started_at > datetime.now():
         started_at -= timedelta(days=1)
 
     qr_col, info_col = st.columns(2)
     with qr_col:
-        st.markdown("**QR / Entry Ticket**")
-        st.code(f"PARKVISION://check-in?vehicle={vehicle_id}", language="text")
+        st.markdown("**QR / Giriş Fişi**")
+        st.code(f"PARKVISION://giris?arac={vehicle_id}", language="text")
     with info_col:
-        st.metric("Assigned vehicle ID", vehicle_id)
-        st.write("This ID will be matched with your session on the payment screen.")
+        st.metric("Atanan araç ID", vehicle_id)
+        st.write("Bu ID ödeme ekranında oturumunuzla eşleştirilecek.")
 
-    if st.button("Enter system", type="primary"):
+    if st.button("Sisteme gir", type="primary"):
         st.session_state.demo_vehicle_id = vehicle_id
         st.session_state.demo_customer_name = customer_name
         st.session_state.demo_started_at = started_at
@@ -189,21 +200,133 @@ def render_entry_gate(session_manager: ParkingSessionManager):
 
 def render_parking_product(session_manager: ParkingSessionManager):
     st.divider()
-    st.subheader("Session and Payment System")
+    st.subheader("Oturum ve Ödeme Sistemi")
 
     demo_session = session_manager.demo_session()
-    if demo_session is not None and demo_session.ended_at is not None and not demo_session.paid:
-        st.warning("You have exited. Continue to the payment page.")
-        if st.button("Continue to payment", type="primary"):
-            st.session_state.screen = "payment"
-            st.rerun()
+    st.markdown("**Ödeme Paneli**")
+    if demo_session is None:
+        st.info("Ödeme oluşturmak için önce kullanıcı girişi yapılmalıdır.")
+    else:
+        duration = round(session_manager.duration_minutes_for(demo_session), 1)
+        amount = session_manager.fee_for(demo_session)
+        exit_time = demo_session.ended_at.strftime("%H:%M") if demo_session.ended_at else "-"
+        status_text = "Ödendi" if demo_session.paid else "Ödeme bekliyor" if demo_session.ended_at else "Park devam ediyor"
 
-    st.markdown("**Parking Sessions**")
+        st.markdown(
+            f"""
+            <div class="payment-panel">
+                <div>
+                    <div class="payment-eyebrow">Güncel oturum</div>
+                    <div class="payment-title">{demo_session.vehicle_id} için ödeme durumu</div>
+                    <div class="payment-subtitle">Oturum: {demo_session.session_id} · Park yeri: {demo_session.spot_id}</div>
+                </div>
+                <div class="payment-amount">{amount:.0f} TL</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        cols = st.columns(4)
+        cols[0].metric("Durum", status_text)
+        cols[1].metric("Giriş", demo_session.started_at.strftime("%H:%M"))
+        cols[2].metric("Çıkış", exit_time)
+        cols[3].metric("Süre", f"{duration} dk")
+
+        action_col, note_col = st.columns([1, 1.4])
+        with action_col:
+            if demo_session.ended_at is None:
+                if st.button("Araç çıkışını simüle et ve ücreti görüntüle", type="primary", use_container_width=True):
+                    session_manager.close_demo_session()
+                    st.session_state.screen = "payment"
+                    st.rerun()
+            elif not demo_session.paid:
+                if st.button("Ödeme ekranına git", type="primary", use_container_width=True):
+                    st.session_state.screen = "payment"
+                    st.rerun()
+            else:
+                st.success("Bu oturumun ödemesi tamamlandı.")
+        with note_col:
+            if demo_session.ended_at is None:
+                st.info("Araç çıkış yaptığında süre ve ücret kesinleşir.")
+            elif not demo_session.paid:
+                st.warning("Çıkış tamamlandı. Ödeme alınması bekleniyor.")
+            else:
+                st.info("Ödeme kaydı veritabanında tamamlandı olarak tutuluyor.")
+
+    st.markdown("**Park Oturumları**")
     rows = session_manager.rows()
     if rows:
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
     else:
-        st.info("No sessions yet.")
+        st.info("Henüz oturum yok.")
+
+    report_rows = session_manager.report_rows()
+    st.markdown("**Raporlar**")
+    st.dataframe(pd.DataFrame(report_rows), use_container_width=True, hide_index=True)
+
+
+def render_payment_screen(session_manager: ParkingSessionManager):
+    st.subheader("Ödeme Sayfası")
+    demo_session = session_manager.demo_session()
+
+    if demo_session is None:
+        st.info("Size bağlı bir oturum bulunamadı.")
+        if st.button("Giriş ekranına dön"):
+            st.session_state.screen = "entry"
+            st.session_state.demo_user_ready = False
+            st.rerun()
+        return
+
+    duration = round(session_manager.duration_minutes_for(demo_session), 1)
+    amount = session_manager.fee_for(demo_session)
+    exit_time = demo_session.ended_at.strftime("%H:%M") if demo_session.ended_at else "-"
+    status_text = "Ödendi" if demo_session.paid else "Ödeme bekliyor" if demo_session.ended_at else "Park devam ediyor"
+
+    st.markdown(
+        f"""
+        <div class="payment-page-hero">
+            <div>
+                <div class="payment-eyebrow">Ödenecek tutar</div>
+                <div class="payment-page-amount">{amount:.0f} TL</div>
+                <div class="payment-subtitle">{demo_session.vehicle_id} · {demo_session.session_id} · {status_text}</div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    detail_col, tariff_col = st.columns([1.2, 0.8])
+    with detail_col:
+        st.markdown("**Oturum Bilgileri**")
+        detail_rows = [
+            {"Alan": "Oturum ID", "Değer": demo_session.session_id},
+            {"Alan": "Araç ID", "Değer": demo_session.vehicle_id},
+            {"Alan": "Giriş Saati", "Değer": demo_session.started_at.strftime("%H:%M")},
+            {"Alan": "Çıkış Saati", "Değer": exit_time},
+            {"Alan": "Süre", "Değer": f"{duration} dk"},
+            {"Alan": "Ödeme Durumu", "Değer": status_text},
+        ]
+        st.dataframe(pd.DataFrame(detail_rows), use_container_width=True, hide_index=True)
+
+        if demo_session.paid:
+            st.success("Ödeme tamamlandı. İyi yolculuklar.")
+        elif demo_session.ended_at is None:
+            st.info("Araç henüz çıkış yapmadı. Ödeme çıkıştan sonra alınır.")
+        elif st.button("Ödemeyi tamamla", type="primary", use_container_width=True):
+            session_manager.mark_paid(demo_session.session_id)
+            st.success("Ödeme tamamlandı. İyi yolculuklar.")
+            st.rerun()
+
+    with tariff_col:
+        st.markdown("**Ücret Tarifesi**")
+        st.dataframe(pd.DataFrame(session_manager.tariff_rows()), use_container_width=True, hide_index=True)
+
+    st.markdown("**Oturum Kaydı**")
+    st.dataframe(pd.DataFrame([session_manager._row(demo_session)]), use_container_width=True, hide_index=True)
+
+    if st.button("Genel bakışa dön"):
+        st.session_state.screen = "main"
+        st.rerun()
 
 
 def inject_theme():
@@ -293,56 +416,63 @@ def inject_theme():
             color: var(--pv-white) !important;
             border-color: #2f2f35 !important;
         }
+        .payment-panel,
+        .payment-page-hero {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 24px;
+            background: #101013;
+            border: 1px solid #2f2f35;
+            border-left: 5px solid var(--pv-blue);
+            border-radius: 8px;
+            padding: 20px 22px;
+            margin: 8px 0 16px 0;
+        }
+        .payment-page-hero {
+            padding: 26px 28px;
+            margin-bottom: 22px;
+        }
+        .payment-eyebrow {
+            color: #b9b9c0;
+            font-size: 0.85rem;
+            font-weight: 600;
+            margin-bottom: 4px;
+        }
+        .payment-title {
+            color: var(--pv-white);
+            font-size: 1.35rem;
+            font-weight: 750;
+        }
+        .payment-subtitle {
+            color: #b9b9c0;
+            font-size: 0.95rem;
+            margin-top: 4px;
+        }
+        .payment-amount,
+        .payment-page-amount {
+            color: var(--pv-white);
+            font-size: 2rem;
+            font-weight: 800;
+            white-space: nowrap;
+        }
+        .payment-page-amount {
+            font-size: 3rem;
+        }
+        @media (max-width: 760px) {
+            .payment-panel,
+            .payment-page-hero {
+                align-items: flex-start;
+                flex-direction: column;
+            }
+            .payment-page-amount {
+                font-size: 2.2rem;
+            }
+        }
         </style>
         """,
         unsafe_allow_html=True,
     )
-
-
-def render_payment_screen(session_manager: ParkingSessionManager):
-    st.subheader("Payment Page")
-    demo_session = session_manager.demo_session()
-
-    if demo_session is None:
-        st.info("No session is linked to you yet.")
-        if st.button("Back to check-in"):
-            st.session_state.screen = "entry"
-            st.session_state.demo_user_ready = False
-            st.rerun()
-        return
-
-    tariff_col, payment_col = st.columns([1, 1])
-    with tariff_col:
-        st.markdown("**Pricing Tariff**")
-        st.dataframe(pd.DataFrame(session_manager.tariff_rows()), use_container_width=True, hide_index=True)
-
-    with payment_col:
-        st.markdown("**Session Details**")
-        st.write(
-            {
-                "Session ID": demo_session.session_id,
-                "Vehicle ID": demo_session.vehicle_id,
-                "Entry Time": demo_session.started_at.strftime("%H:%M"),
-                "Exit Time": demo_session.ended_at.strftime("%H:%M") if demo_session.ended_at else "-",
-                "Duration (min)": round(session_manager.duration_minutes_for(demo_session), 1),
-            }
-        )
-        st.metric("Amount due", f"{session_manager.fee_for(demo_session):.0f} TL")
-
-        if demo_session.paid:
-            st.success("Payment completed. Have a safe trip.")
-        elif demo_session.ended_at is None:
-            st.info("The vehicle has not exited yet. Payment is collected after exit.")
-        elif st.button("Complete payment", type="primary"):
-            session_manager.mark_paid(demo_session.session_id)
-            st.success("Payment completed. Have a safe trip.")
-
-    st.markdown("**Session Record**")
-    st.dataframe(pd.DataFrame([session_manager._row(demo_session)]), use_container_width=True, hide_index=True)
-
-    if st.button("Back to overview"):
-        st.session_state.screen = "main"
-        st.rerun()
 
 
 if __name__ == "__main__":

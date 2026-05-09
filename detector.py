@@ -89,7 +89,7 @@ class ParkingDetector:
         cv2.rectangle(frame, (70, 20), (620, 85), (0, 0, 0), -1)
         cv2.putText(
             frame,
-            f"Available spots: {available} / {total}",
+            f"Bos yer: {available} / {total}",
             (95, 62),
             cv2.FONT_HERSHEY_SIMPLEX,
             1,

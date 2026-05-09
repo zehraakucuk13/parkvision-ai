@@ -74,17 +74,17 @@ class ParkingVehicleTracker:
     def rows(self) -> list[dict]:
         parked = [
             {
-                "Vehicle ID": vehicle_id,
-                "Status": "Checked in" if vehicle_id in self.entry_vehicle_ids else "Parked",
+                "Araç ID": vehicle_id,
+                "Durum": "Giriş yaptı" if vehicle_id in self.entry_vehicle_ids else "Park halinde",
             }
             for vehicle_id in sorted(self.parked_vehicle_ids.values())
         ]
         exiting = [
-            {"Vehicle ID": track.vehicle_id, "Status": "Exiting"}
+            {"Araç ID": track.vehicle_id, "Durum": "Çıkıyor"}
             for track in self.exiting_tracks
         ]
         completed = [
-            {"Vehicle ID": vehicle_id, "Status": "Exited"}
+            {"Araç ID": vehicle_id, "Durum": "Çıkış yaptı"}
             for vehicle_id in self.completed_vehicle_ids[-20:]
         ]
         return parked + exiting + completed

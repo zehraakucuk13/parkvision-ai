@@ -1,7 +1,6 @@
 from pathlib import Path
 import pickle
 
-from skimage.transform import resize
 import numpy as np
 import cv2
 
@@ -17,7 +16,8 @@ def empty_or_not(spot_bgr):
 
     flat_data = []
 
-    img_resized = resize(spot_bgr, (15, 15, 3))
+    img_resized = cv2.resize(spot_bgr, (15, 15), interpolation=cv2.INTER_AREA)
+    img_resized = img_resized.astype("float32") / 255.0
     flat_data.append(img_resized.flatten())
     flat_data = np.array(flat_data)
 
@@ -45,4 +45,3 @@ def get_parking_spots_bboxes(connected_components):
         slots.append([x1, y1, w, h])
 
     return slots
-
