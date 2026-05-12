@@ -21,7 +21,7 @@ class ParkingVehicleTracker:
         self.max_missed_frames = max_missed_frames
         self.tracker_box_scale = tracker_box_scale
         self.exit_motion_threshold = exit_motion_threshold
-        self._vehicle_counter = 0
+        self._vehicle_counter = 76
         self._previous_statuses: dict[str, bool] = {}
         self._previous_frame = None
         self.parked_vehicle_ids: dict[str, str] = {}

@@ -65,6 +65,15 @@ def init_db():
         conn.commit()
 
 
+def reset_demo_data() -> None:
+    init_db()
+    with get_connection() as conn:
+        conn.execute("DELETE FROM customer_payment_methods")
+        conn.execute("DELETE FROM parking_sessions")
+        conn.execute("DELETE FROM parking_slots")
+        conn.commit()
+
+
 def upsert_slots(spot_boxes: dict[str, list[int]]) -> None:
     with get_connection() as conn:
         for spot_id, box in spot_boxes.items():

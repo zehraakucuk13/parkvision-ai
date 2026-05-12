@@ -8,7 +8,7 @@ import cv2
 import pandas as pd
 import streamlit as st
 
-from database import upsert_slots
+from database import reset_demo_data, upsert_slots
 from detector import ParkingDetector
 from parking_sessions import ParkingSessionManager
 from vehicle_tracker import ParkingVehicleTracker
@@ -97,6 +97,9 @@ def main():
     st.session_state.setdefault("demo_user_ready", False)
     st.session_state.setdefault("role", None)
     st.session_state.setdefault("screen", "role_login")
+    if "demo_db_reset_done" not in st.session_state:
+        reset_demo_data()
+        st.session_state.demo_db_reset_done = True
     if "default_entry_time" not in st.session_state:
         st.session_state.default_entry_time = datetime.now() - timedelta(minutes=random.randint(35, 125))
 
@@ -141,12 +144,13 @@ def main():
         )
 
     with st.sidebar:
-        run = st.toggle("Canlı demoyu başlat", value=False)
+        run = st.toggle("Canlı demoyu başlat", value=True)
 
     video_col, info_col = st.columns([2.2, 1])
     frame_slot = video_col.empty()
     metric_slot = info_col.empty()
     vehicle_slot = st.empty()
+    admin_tables_slot = st.empty()
 
     if not run:
         st.session_state.demo_finished = False
@@ -193,6 +197,9 @@ def main():
             vehicle_slot.dataframe(pd.DataFrame(vehicle_rows), use_container_width=True, hide_index=True)
         else:
             vehicle_slot.info("Henüz araç hareketi yok.")
+
+        with admin_tables_slot.container():
+            render_parking_product(session_manager)
 
     cap = cv2.VideoCapture(str(DEFAULT_VIDEO_PATH))
     if not cap.isOpened():
@@ -263,7 +270,6 @@ def render_role_login():
             st.session_state.screen = "entry"
             st.session_state.demo_user_ready = False
             st.session_state.pop("demo_session_id", None)
-            st.session_state.pending_vehicle_id = get_session_manager().next_vehicle_id()
             st.rerun()
 
     with admin_col:
@@ -328,7 +334,6 @@ def render_driver_session(session_manager: ParkingSessionManager):
             st.session_state.demo_user_ready = False
             st.session_state.screen = "entry"
             st.session_state.pop("demo_session_id", None)
-            st.session_state.pending_vehicle_id = session_manager.next_vehicle_id()
             st.rerun()
 
 
@@ -337,10 +342,7 @@ def render_entry_gate(session_manager: ParkingSessionManager):
     st.caption("Araç ID'nizi giriş fişi/QR ekranından alın, giriş saatinizi onaylayın ve sisteme devam edin.")
 
     default_started_at = st.session_state.default_entry_time
-    if "pending_vehicle_id" not in st.session_state or st.session_state.get("demo_user_ready"):
-        st.session_state.pending_vehicle_id = session_manager.next_vehicle_id()
-    vehicle_id = st.session_state.pending_vehicle_id
-    st.text_input("Araç ID", value=vehicle_id, disabled=True)
+    vehicle_id = st.text_input("Araç ID", value=st.session_state.get("demo_vehicle_id", "V-0077"))
     customer_name = st.text_input("Ad / telefon", value="Demo Kullanıcı")
     entry_time = st.time_input("Park giriş saati", value=default_started_at.time().replace(second=0, microsecond=0))
     started_at = datetime.combine(datetime.now().date(), entry_time)
@@ -363,7 +365,6 @@ def render_entry_gate(session_manager: ParkingSessionManager):
         st.session_state.screen = "main"
         demo_session = session_manager.start_demo_session(vehicle_id, customer_name, started_at)
         st.session_state.demo_session_id = demo_session.session_id
-        del st.session_state.pending_vehicle_id
         st.rerun()
 
 
@@ -423,7 +424,6 @@ def render_parking_product(session_manager: ParkingSessionManager):
                     st.session_state.demo_user_ready = False
                     st.session_state.screen = "entry"
                     st.session_state.pop("demo_session_id", None)
-                    st.session_state.pending_vehicle_id = session_manager.next_vehicle_id()
                     st.rerun()
         with note_col:
             if demo_session.ended_at is None:
@@ -501,7 +501,6 @@ def render_payment_screen(session_manager: ParkingSessionManager):
                 st.session_state.demo_user_ready = False
                 st.session_state.screen = "entry"
                 st.session_state.pop("demo_session_id", None)
-                st.session_state.pending_vehicle_id = session_manager.next_vehicle_id()
                 st.rerun()
         elif demo_session.ended_at is None:
             st.info("Araç henüz çıkış yapmadı. Ödeme çıkıştan sonra alınır.")
