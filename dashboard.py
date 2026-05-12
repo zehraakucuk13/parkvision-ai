@@ -203,7 +203,7 @@ def render_tracking_video(session_manager: ParkingSessionManager):
         if not ok:
             vehicle_tracker.complete_exiting_tracks()
             if last_annotated is not None:
-                frame_slot.image(last_annotated, channels="RGB", width="stretch")
+                frame_slot.image(last_annotated, channels="RGB", use_container_width=True)
             render_side_panel(last_statuses)
             st.info("Video bitti.")
             time.sleep(END_HOLD_SECONDS)
@@ -221,7 +221,7 @@ def render_tracking_video(session_manager: ParkingSessionManager):
             annotated = cv2.resize(annotated, (DISPLAY_WIDTH, display_height), interpolation=cv2.INTER_AREA)
 
         last_annotated = annotated
-        frame_slot.image(annotated, channels="RGB", width="stretch")
+        frame_slot.image(annotated, channels="RGB", use_container_width=True)
 
         if frame_index % PANEL_UPDATE_EVERY_FRAMES == 0:
             render_side_panel(statuses)
@@ -231,7 +231,7 @@ def render_tracking_video(session_manager: ParkingSessionManager):
             if not ok:
                 vehicle_tracker.complete_exiting_tracks()
                 if last_annotated is not None:
-                    frame_slot.image(last_annotated, channels="RGB", width="stretch")
+                    frame_slot.image(last_annotated, channels="RGB", use_container_width=True)
                 render_side_panel(last_statuses)
                 st.info("Video bitti.")
                 time.sleep(END_HOLD_SECONDS)
