@@ -1,6 +1,7 @@
 from pathlib import Path
 from datetime import datetime, timedelta
 import random
+import re
 import time
 
 import cv2
@@ -23,6 +24,64 @@ DEFAULT_MASK_PATH = BASE_DIR / "mask_1920_1080.png"
 DEFAULT_SPEED = 8
 
 
+def normalize_card_number(card_number: str) -> str:
+    return re.sub(r"\D", "", card_number or "")
+
+
+def is_valid_card_number(card_number: str) -> bool:
+    digits = normalize_card_number(card_number)
+    if not 13 <= len(digits) <= 19:
+        return False
+
+    checksum = 0
+    reversed_digits = digits[::-1]
+    for index, digit in enumerate(reversed_digits):
+        value = int(digit)
+        if index % 2 == 1:
+            value *= 2
+            if value > 9:
+                value -= 9
+        checksum += value
+
+    return checksum % 10 == 0
+
+
+def is_valid_expiry(expiry: str) -> bool:
+    parsed = parse_expiry(expiry)
+    if parsed is None:
+        return False
+
+    month, year = parsed
+    now = datetime.now()
+    return (year, month) >= (now.year, now.month)
+
+
+def parse_expiry(expiry: str) -> tuple[int, int] | None:
+    match = re.fullmatch(r"(0[1-9]|1[0-2])\s*/\s*(\d{2}|\d{4})", (expiry or "").strip())
+    if not match:
+        return None
+
+    month = int(match.group(1))
+    year_text = match.group(2)
+    year = int(year_text) if len(year_text) == 4 else 2000 + int(year_text)
+    return month, year
+
+
+def is_valid_cvv(cvv: str) -> bool:
+    return bool(re.fullmatch(r"\d{3,4}", (cvv or "").strip()))
+
+
+def card_brand_for(card_number: str) -> str:
+    digits = normalize_card_number(card_number)
+    if digits.startswith("4"):
+        return "Visa"
+    if digits[:2] in {"51", "52", "53", "54", "55"} or 2221 <= int(digits[:4] or 0) <= 2720:
+        return "Mastercard"
+    if digits.startswith(("34", "37")):
+        return "American Express"
+    return "Kart"
+
+
 def get_session_manager() -> ParkingSessionManager:
     if "parking_session_manager" not in st.session_state:
         st.session_state.parking_session_manager = ParkingSessionManager()
@@ -36,25 +95,50 @@ def main():
 
     st.session_state.setdefault("demo_finished", False)
     st.session_state.setdefault("demo_user_ready", False)
-    st.session_state.setdefault("screen", "entry")
+    st.session_state.setdefault("role", None)
+    st.session_state.setdefault("screen", "role_login")
     if "default_entry_time" not in st.session_state:
         st.session_state.default_entry_time = datetime.now() - timedelta(minutes=random.randint(35, 125))
 
     session_manager = get_session_manager()
 
-    if st.session_state.screen == "payment":
-        render_payment_screen(session_manager)
+    if st.session_state.role is None:
+        render_role_login()
         return
 
-    if not st.session_state.demo_user_ready:
-        render_entry_gate(session_manager)
+    with st.sidebar:
+        role_label = "Yönetici" if st.session_state.role == "admin" else "Sürücü"
+        st.caption(f"Giriş: {role_label}")
+        if st.button("Çıkış yap", use_container_width=True):
+            st.session_state.role = None
+            st.session_state.screen = "role_login"
+            st.session_state.demo_user_ready = False
+            st.session_state.pop("demo_session_id", None)
+            st.rerun()
+
+    if st.session_state.role == "driver":
+        if "demo_vehicle_id" in st.session_state:
+            session_manager.demo_vehicle_id = st.session_state.demo_vehicle_id
+            session_manager.demo_customer_name = st.session_state.get("demo_customer_name", "")
+            session_manager.demo_started_at = st.session_state.get("demo_started_at")
+
+        if st.session_state.screen == "payment":
+            render_payment_screen(session_manager)
+            return
+
+        if not st.session_state.demo_user_ready:
+            render_entry_gate(session_manager)
+            return
+
+        render_driver_session(session_manager)
         return
 
-    session_manager.set_demo_user(
-        st.session_state.demo_vehicle_id,
-        st.session_state.demo_customer_name,
-        st.session_state.demo_started_at,
-    )
+    if st.session_state.demo_user_ready:
+        session_manager.set_demo_user(
+            st.session_state.demo_vehicle_id,
+            st.session_state.demo_customer_name,
+            st.session_state.demo_started_at,
+        )
 
     with st.sidebar:
         run = st.toggle("Canlı demoyu başlat", value=False)
@@ -168,12 +252,95 @@ def main():
     render_parking_product(session_manager)
 
 
+def render_role_login():
+    st.subheader("Giriş")
+    driver_col, admin_col = st.columns(2)
+
+    with driver_col:
+        st.markdown("**Sürücü Girişi**")
+        if st.button("Sürücü olarak giriş yap", type="primary", use_container_width=True):
+            st.session_state.role = "driver"
+            st.session_state.screen = "entry"
+            st.session_state.demo_user_ready = False
+            st.session_state.pop("demo_session_id", None)
+            st.session_state.pending_vehicle_id = get_session_manager().next_vehicle_id()
+            st.rerun()
+
+    with admin_col:
+        st.markdown("**Yönetici Girişi**")
+        with st.form("admin_login_form"):
+            password = st.text_input("Yönetici parolası", type="password")
+            submitted = st.form_submit_button("Yönetici olarak giriş yap", use_container_width=True)
+
+        if submitted:
+            if password == "123":
+                st.session_state.role = "admin"
+                st.session_state.screen = "admin"
+                st.session_state.demo_user_ready = False
+                st.rerun()
+            else:
+                st.error("Yönetici parolası hatalı.")
+
+
+def render_driver_session(session_manager: ParkingSessionManager):
+    st.subheader("Sürücü Oturumu")
+    demo_session = session_manager.get_by_session_id(st.session_state.get("demo_session_id", ""))
+
+    if demo_session is None:
+        st.info("Aktif oturum bulunamadı.")
+        if st.button("Giriş ekranına dön"):
+            st.session_state.demo_user_ready = False
+            st.session_state.screen = "entry"
+            st.rerun()
+        return
+
+    duration = round(session_manager.duration_minutes_for(demo_session), 1)
+    amount = session_manager.fee_for(demo_session)
+    exit_time = demo_session.ended_at.strftime("%H:%M") if demo_session.ended_at else "-"
+    status_text = "Ödendi" if demo_session.paid else "Ödeme bekliyor" if demo_session.ended_at else "Park devam ediyor"
+
+    cols = st.columns(4)
+    cols[0].metric("Araç ID", demo_session.vehicle_id)
+    cols[1].metric("Durum", status_text)
+    cols[2].metric("Süre", f"{duration} dk")
+    cols[3].metric("Ücret", f"{amount:.0f} TL")
+
+    detail_rows = [
+        {"Alan": "Oturum ID", "Değer": demo_session.session_id},
+        {"Alan": "Ad / telefon", "Değer": demo_session.customer_name or "-"},
+        {"Alan": "Giriş Saati", "Değer": demo_session.started_at.strftime("%H:%M")},
+        {"Alan": "Çıkış Saati", "Değer": exit_time},
+    ]
+    st.dataframe(pd.DataFrame(detail_rows), use_container_width=True, hide_index=True)
+
+    if demo_session.ended_at is None:
+        if st.button("Çıkış yap ve ödeme ekranına geç", type="primary", use_container_width=True):
+            session_manager.close_session(demo_session.session_id)
+            st.session_state.screen = "payment"
+            st.rerun()
+    elif not demo_session.paid:
+        if st.button("Ödeme ekranına git", type="primary", use_container_width=True):
+            st.session_state.screen = "payment"
+            st.rerun()
+    else:
+        st.success("Bu oturumun ödemesi tamamlandı.")
+        if st.button("Yeni sürücü girişi", use_container_width=True):
+            st.session_state.demo_user_ready = False
+            st.session_state.screen = "entry"
+            st.session_state.pop("demo_session_id", None)
+            st.session_state.pending_vehicle_id = session_manager.next_vehicle_id()
+            st.rerun()
+
+
 def render_entry_gate(session_manager: ParkingSessionManager):
     st.subheader("Kullanıcı Girişi")
     st.caption("Araç ID'nizi giriş fişi/QR ekranından alın, giriş saatinizi onaylayın ve sisteme devam edin.")
 
     default_started_at = st.session_state.default_entry_time
-    vehicle_id = st.selectbox("Araç ID", ["V-0077"], index=0)
+    if "pending_vehicle_id" not in st.session_state or st.session_state.get("demo_user_ready"):
+        st.session_state.pending_vehicle_id = session_manager.next_vehicle_id()
+    vehicle_id = st.session_state.pending_vehicle_id
+    st.text_input("Araç ID", value=vehicle_id, disabled=True)
     customer_name = st.text_input("Ad / telefon", value="Demo Kullanıcı")
     entry_time = st.time_input("Park giriş saati", value=default_started_at.time().replace(second=0, microsecond=0))
     started_at = datetime.combine(datetime.now().date(), entry_time)
@@ -194,19 +361,26 @@ def render_entry_gate(session_manager: ParkingSessionManager):
         st.session_state.demo_started_at = started_at
         st.session_state.demo_user_ready = True
         st.session_state.screen = "main"
-        session_manager.set_demo_user(vehicle_id, customer_name, started_at)
+        demo_session = session_manager.start_demo_session(vehicle_id, customer_name, started_at)
+        st.session_state.demo_session_id = demo_session.session_id
+        del st.session_state.pending_vehicle_id
         st.rerun()
 
 
 def render_parking_product(session_manager: ParkingSessionManager):
     st.divider()
-    st.subheader("Oturum ve Ödeme Sistemi")
+    is_admin = st.session_state.get("role") == "admin"
+    st.subheader("Yönetim Paneli" if is_admin else "Oturum ve Ödeme Sistemi")
 
     demo_session = session_manager.demo_session()
-    st.markdown("**Ödeme Paneli**")
-    if demo_session is None:
-        st.info("Ödeme oluşturmak için önce kullanıcı girişi yapılmalıdır.")
+    if is_admin:
+        st.markdown("**Otopark ve Ödeme Kayıtları**")
     else:
+        st.markdown("**Ödeme Paneli**")
+
+    if demo_session is None and not is_admin:
+        st.info("Ödeme oluşturmak için önce kullanıcı girişi yapılmalıdır.")
+    elif demo_session is not None and not is_admin:
         duration = round(session_manager.duration_minutes_for(demo_session), 1)
         amount = session_manager.fee_for(demo_session)
         exit_time = demo_session.ended_at.strftime("%H:%M") if demo_session.ended_at else "-"
@@ -245,6 +419,12 @@ def render_parking_product(session_manager: ParkingSessionManager):
                     st.rerun()
             else:
                 st.success("Bu oturumun ödemesi tamamlandı.")
+                if st.button("Yeni kullanıcı girişi", use_container_width=True):
+                    st.session_state.demo_user_ready = False
+                    st.session_state.screen = "entry"
+                    st.session_state.pop("demo_session_id", None)
+                    st.session_state.pending_vehicle_id = session_manager.next_vehicle_id()
+                    st.rerun()
         with note_col:
             if demo_session.ended_at is None:
                 st.info("Araç çıkış yaptığında süre ve ücret kesinleşir.")
@@ -264,10 +444,17 @@ def render_parking_product(session_manager: ParkingSessionManager):
     st.markdown("**Raporlar**")
     st.dataframe(pd.DataFrame(report_rows), use_container_width=True, hide_index=True)
 
+    st.markdown("**Kullanıcı Ödeme Bilgileri**")
+    payment_method_rows = session_manager.payment_method_rows()
+    if payment_method_rows:
+        st.dataframe(pd.DataFrame(payment_method_rows), use_container_width=True, hide_index=True)
+    else:
+        st.info("Henüz kayıtlı ödeme yöntemi yok.")
+
 
 def render_payment_screen(session_manager: ParkingSessionManager):
     st.subheader("Ödeme Sayfası")
-    demo_session = session_manager.demo_session()
+    demo_session = session_manager.get_by_session_id(st.session_state.get("demo_session_id", ""))
 
     if demo_session is None:
         st.info("Size bağlı bir oturum bulunamadı.")
@@ -310,12 +497,70 @@ def render_payment_screen(session_manager: ParkingSessionManager):
 
         if demo_session.paid:
             st.success("Ödeme tamamlandı. İyi yolculuklar.")
+            if st.button("Yeni kullanıcı girişi", use_container_width=True):
+                st.session_state.demo_user_ready = False
+                st.session_state.screen = "entry"
+                st.session_state.pop("demo_session_id", None)
+                st.session_state.pending_vehicle_id = session_manager.next_vehicle_id()
+                st.rerun()
         elif demo_session.ended_at is None:
             st.info("Araç henüz çıkış yapmadı. Ödeme çıkıştan sonra alınır.")
-        elif st.button("Ödemeyi tamamla", type="primary", use_container_width=True):
-            session_manager.mark_paid(demo_session.session_id)
-            st.success("Ödeme tamamlandı. İyi yolculuklar.")
-            st.rerun()
+        else:
+            saved_method = session_manager.payment_method_for_customer(demo_session.customer_name)
+            if saved_method:
+                st.info(f"Kayıtlı ödeme yöntemi bulundu: {saved_method['display_name']}")
+                with st.form("saved_payment_form"):
+                    saved_cvv = st.text_input("Kayıtlı kart CVV", type="password", placeholder="•••", max_chars=4)
+                    saved_submitted = st.form_submit_button(
+                        "Kayıtlı ödeme yöntemiyle öde",
+                        type="primary",
+                        use_container_width=True,
+                    )
+
+                if saved_submitted:
+                    if not is_valid_cvv(saved_cvv):
+                        st.error("Geçerli bir kredi kartı giriniz.")
+                    else:
+                        session_manager.mark_paid_with_method(demo_session.session_id, saved_method["display_name"])
+                        st.success("Ödeme kayıtlı yöntemle tamamlandı. İyi yolculuklar.")
+                        st.rerun()
+
+            with st.form("payment_card_form"):
+                st.markdown("**Kart Bilgileri**")
+                cardholder_name = st.text_input("Kart üzerindeki ad soyad", value=demo_session.customer_name)
+                card_number = st.text_input("Kart numarası", placeholder="1234 5678 9012 3456")
+                expiry_col, cvv_col = st.columns(2)
+                expiry = expiry_col.text_input("Son kullanma tarihi", placeholder="AA/YY veya AA/YYYY")
+                cvv = cvv_col.text_input("CVV", type="password", placeholder="123", max_chars=4)
+                save_payment_method = st.checkbox("Ödeme yolunu kaydet")
+                submitted = st.form_submit_button("Ödemeyi tamamla", type="primary", use_container_width=True)
+
+            if submitted:
+                parsed_expiry = parse_expiry(expiry)
+                if (
+                    not cardholder_name.strip()
+                    or not is_valid_card_number(card_number)
+                    or parsed_expiry is None
+                    or not is_valid_expiry(expiry)
+                    or not is_valid_cvv(cvv)
+                ):
+                    st.error("Geçerli bir kredi kartı giriniz.")
+                else:
+                    payment_method_label = ""
+                    if save_payment_method:
+                        expiry_month, expiry_year = parsed_expiry
+                        digits = normalize_card_number(card_number)
+                        payment_method_label = session_manager.save_payment_method(
+                            demo_session.customer_name or cardholder_name,
+                            cardholder_name,
+                            card_brand_for(card_number),
+                            digits[-4:],
+                            expiry_month,
+                            expiry_year,
+                        )
+                    session_manager.mark_paid_with_method(demo_session.session_id, payment_method_label)
+                    st.success("Ödeme tamamlandı. İyi yolculuklar.")
+                    st.rerun()
 
     with tariff_col:
         st.markdown("**Ücret Tarifesi**")

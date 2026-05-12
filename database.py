@@ -42,6 +42,26 @@ def init_db():
             )
             """
         )
+        columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(parking_sessions)").fetchall()
+        }
+        if "payment_method_label" not in columns:
+            conn.execute("ALTER TABLE parking_sessions ADD COLUMN payment_method_label TEXT DEFAULT ''")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS customer_payment_methods (
+                customer_name TEXT PRIMARY KEY,
+                cardholder_name TEXT NOT NULL,
+                card_brand TEXT NOT NULL,
+                card_last4 TEXT NOT NULL,
+                expiry_month INTEGER NOT NULL,
+                expiry_year INTEGER NOT NULL,
+                display_name TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
         conn.commit()
 
 

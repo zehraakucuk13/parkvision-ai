@@ -16,6 +16,7 @@ class ParkingSession:
     paid: bool = False
     ended_at: datetime | None = None
     fee: float = 0.0
+    payment_method_label: str = ""
 
 
 class ParkingSessionManager:
@@ -49,6 +50,39 @@ class ParkingSessionManager:
             )
             conn.commit()
         self.ensure_demo_session()
+
+    def next_vehicle_id(self) -> str:
+        with get_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT DISTINCT vehicle_id
+                FROM parking_sessions
+                WHERE vehicle_id LIKE 'V-%'
+                """
+            ).fetchall()
+
+        highest_id = 76
+        for row in rows:
+            vehicle_id = row["vehicle_id"]
+            suffix = vehicle_id.removeprefix("V-")
+            if suffix.isdigit():
+                highest_id = max(highest_id, int(suffix))
+
+        return f"V-{highest_id + 1:04d}"
+
+    def start_demo_session(self, vehicle_id: str, customer_name: str, started_at: datetime) -> ParkingSession:
+        self.demo_vehicle_id = vehicle_id
+        self.demo_customer_name = customer_name.strip()
+        self.demo_started_at = started_at
+
+        session = self._new_session(
+            vehicle_id=vehicle_id,
+            spot_id="ENTRY",
+            source="Giriş yaptı",
+            started_at=started_at,
+        )
+        self._insert_session(session)
+        return session
 
     def ensure_demo_session(self) -> ParkingSession:
         session = self._active_session_by_vehicle(self.demo_vehicle_id)
@@ -86,6 +120,32 @@ class ParkingSessionManager:
             conn.commit()
 
         return self.get_by_session_id(session.session_id)
+
+    def close_session(self, session_id: str) -> ParkingSession | None:
+        session = self.get_by_session_id(session_id)
+        if session is None:
+            return None
+
+        now = datetime.now()
+        session.ended_at = now
+        fee = self.fee_for(session)
+        duration = self.duration_minutes_for(session)
+
+        with get_connection() as conn:
+            conn.execute(
+                """
+                UPDATE parking_sessions
+                SET ended_at = ?,
+                    duration_min = ?,
+                    fee = ?,
+                    payment_status = 'payment_pending'
+                WHERE session_id = ?
+                """,
+                (now.isoformat(), duration, fee, session_id),
+            )
+            conn.commit()
+
+        return self.get_by_session_id(session_id)
 
     def sync(
         self,
@@ -153,6 +213,105 @@ class ParkingSessionManager:
             )
             conn.commit()
 
+    def mark_paid_with_method(self, session_id: str, payment_method_label: str = "") -> None:
+        with get_connection() as conn:
+            conn.execute(
+                """
+                UPDATE parking_sessions
+                SET payment_status = 'paid',
+                    paid_at = ?,
+                    payment_method_label = ?
+                WHERE session_id = ?
+                """,
+                (datetime.now().isoformat(), payment_method_label, session_id),
+            )
+            conn.commit()
+
+    def save_payment_method(
+        self,
+        customer_name: str,
+        cardholder_name: str,
+        card_brand: str,
+        card_last4: str,
+        expiry_month: int,
+        expiry_year: int,
+    ) -> str:
+        display_name = f"{card_brand} •••• {card_last4} - {expiry_month:02d}/{expiry_year}"
+        with get_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO customer_payment_methods (
+                    customer_name,
+                    cardholder_name,
+                    card_brand,
+                    card_last4,
+                    expiry_month,
+                    expiry_year,
+                    display_name,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(customer_name) DO UPDATE SET
+                    cardholder_name = excluded.cardholder_name,
+                    card_brand = excluded.card_brand,
+                    card_last4 = excluded.card_last4,
+                    expiry_month = excluded.expiry_month,
+                    expiry_year = excluded.expiry_year,
+                    display_name = excluded.display_name,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    customer_name.strip(),
+                    cardholder_name.strip(),
+                    card_brand,
+                    card_last4,
+                    expiry_month,
+                    expiry_year,
+                    display_name,
+                    datetime.now().isoformat(),
+                ),
+            )
+            conn.commit()
+        return display_name
+
+    def payment_method_for_customer(self, customer_name: str) -> dict | None:
+        clean_name = customer_name.strip()
+        if not clean_name:
+            return None
+
+        with get_connection() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM customer_payment_methods
+                WHERE lower(customer_name) = lower(?)
+                """,
+                (clean_name,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def payment_method_rows(self) -> list[dict]:
+        with get_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM customer_payment_methods
+                ORDER BY updated_at DESC
+                """
+            ).fetchall()
+
+        return [
+            {
+                "Müşteri": row["customer_name"],
+                "Kart Sahibi": row["cardholder_name"],
+                "Kart": row["display_name"],
+                "Son 4 Hane": row["card_last4"],
+                "Son Kullanma": f"{row['expiry_month']:02d}/{row['expiry_year']}",
+                "Güncellendi": datetime.fromisoformat(row["updated_at"]).strftime("%d.%m.%Y %H:%M"),
+            }
+            for row in rows
+        ]
+
     def get_by_session_id(self, session_id: str) -> ParkingSession | None:
         with get_connection() as conn:
             row = conn.execute(
@@ -175,7 +334,9 @@ class ParkingSessionManager:
                 SELECT *
                 FROM parking_sessions
                 WHERE vehicle_id = ?
-                ORDER BY started_at DESC
+                ORDER BY
+                    CASE WHEN ended_at IS NULL THEN 0 ELSE 1 END,
+                    started_at DESC
                 LIMIT 1
                 """,
                 (self.demo_vehicle_id,),
@@ -345,8 +506,21 @@ class ParkingSessionManager:
 
     def _next_session_id(self) -> str:
         with get_connection() as conn:
-            count = conn.execute("SELECT COUNT(*) FROM parking_sessions").fetchone()[0]
-        return f"P-{count + 1:05d}"
+            rows = conn.execute(
+                """
+                SELECT session_id
+                FROM parking_sessions
+                WHERE session_id LIKE 'P-%'
+                """
+            ).fetchall()
+
+        highest_id = 0
+        for row in rows:
+            suffix = row["session_id"].removeprefix("P-")
+            if suffix.isdigit():
+                highest_id = max(highest_id, int(suffix))
+
+        return f"P-{highest_id + 1:05d}"
 
     @staticmethod
     def _session_from_row(row) -> ParkingSession:
@@ -360,6 +534,7 @@ class ParkingSessionManager:
             paid=row["payment_status"] == "paid",
             ended_at=datetime.fromisoformat(row["ended_at"]) if row["ended_at"] else None,
             fee=float(row["fee"] or 0),
+            payment_method_label=row["payment_method_label"] if "payment_method_label" in row.keys() else "",
         )
 
     def _row(self, session: ParkingSession) -> dict:
@@ -387,4 +562,5 @@ class ParkingSessionManager:
             "Süre (dk)": round(self.duration_minutes_for(session), 1),
             "Ücret (TL)": self.fee_for(session),
             "Ödeme": payment_status,
+            "Ödeme Yöntemi": session.payment_method_label or "-",
         }
