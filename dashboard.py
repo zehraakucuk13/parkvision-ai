@@ -140,31 +140,19 @@ def main():
         render_payment_lookup(session_manager)
         return
 
-    if st.session_state.demo_user_ready:
-        session_manager.set_demo_user(
-            st.session_state.demo_vehicle_id,
-            st.session_state.demo_customer_name,
-            st.session_state.demo_started_at,
-        )
+    render_parking_product(session_manager)
 
-    with st.sidebar:
-        run = st.toggle("Canlı demoyu başlat", value=True)
+
+def render_tracking_video(session_manager: ParkingSessionManager):
+    run = st.toggle("Giriş videosunu çalıştır", value=False)
 
     video_col, info_col = st.columns([2.2, 1])
     frame_slot = video_col.empty()
     metric_slot = info_col.empty()
     vehicle_slot = st.empty()
-    admin_tables_slot = st.empty()
 
     if not run:
-        st.session_state.demo_finished = False
-        st.info("Park doluluğunu algılamak, oturumları kaydetmek ve ödeme kayıtlarını güncellemek için demoyu başlatın.")
-        render_parking_product(session_manager)
-        return
-
-    if st.session_state.demo_finished:
-        st.info("Video bitti.")
-        render_parking_product(session_manager)
+        st.info("Video çalıştırıldığında araç giriş-çıkışları algılanır ve kayıtlar güncellenir.")
         return
 
     detector = ParkingDetector(str(DEFAULT_MASK_PATH), step=1, roi=ROI)
@@ -202,13 +190,9 @@ def main():
         else:
             vehicle_slot.info("Henüz araç hareketi yok.")
 
-        with admin_tables_slot.container():
-            render_parking_product(session_manager)
-
     cap = cv2.VideoCapture(str(DEFAULT_VIDEO_PATH))
     if not cap.isOpened():
         st.error(f"Video açılamadı: {DEFAULT_VIDEO_PATH}")
-        render_parking_product(session_manager)
         return
 
     fps = cap.get(cv2.CAP_PROP_FPS) or 30
@@ -218,7 +202,6 @@ def main():
         ok, frame = cap.read()
         if not ok:
             vehicle_tracker.complete_exiting_tracks()
-            st.session_state.demo_finished = True
             if last_annotated is not None:
                 frame_slot.image(last_annotated, channels="RGB", width="stretch")
             render_side_panel(last_statuses)
@@ -247,7 +230,6 @@ def main():
             ok, _ = cap.read()
             if not ok:
                 vehicle_tracker.complete_exiting_tracks()
-                st.session_state.demo_finished = True
                 if last_annotated is not None:
                     frame_slot.image(last_annotated, channels="RGB", width="stretch")
                 render_side_panel(last_statuses)
@@ -260,7 +242,6 @@ def main():
         time.sleep(frame_delay)
 
     cap.release()
-    render_parking_product(session_manager)
 
 
 def render_role_login():
@@ -372,6 +353,7 @@ def render_payment_lookup(session_manager: ParkingSessionManager):
 def render_entry_gate(session_manager: ParkingSessionManager):
     st.subheader("Kullanıcı Girişi")
     st.caption("Araç ID'nizi giriş fişi/QR ekranından alın, giriş saatinizi onaylayın ve sisteme devam edin.")
+    render_tracking_video(session_manager)
 
     default_started_at = st.session_state.default_entry_time
     vehicle_id = st.text_input("Araç ID", value=st.session_state.get("demo_vehicle_id", "V-0077"))
