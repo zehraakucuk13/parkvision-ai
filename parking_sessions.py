@@ -33,6 +33,7 @@ class ParkingSessionManager:
         self.demo_vehicle_id = "V-0077"
         self.demo_customer_name = ""
         self.demo_started_at: datetime | None = None
+        self._processed_completed_vehicle_ids: set[str] = set()
 
     def set_demo_user(self, vehicle_id: str, customer_name: str, started_at: datetime) -> None:
         self.demo_vehicle_id = vehicle_id
@@ -156,6 +157,7 @@ class ParkingSessionManager:
         now = datetime.now()
 
         for spot_id, vehicle_id in parked_vehicle_ids.items():
+            self._processed_completed_vehicle_ids.discard(vehicle_id)
             active_session = self._active_session_by_vehicle(vehicle_id)
             if active_session is None:
                 session = self._new_session(
@@ -174,6 +176,11 @@ class ParkingSessionManager:
                     conn.commit()
 
         for vehicle_id in completed_vehicle_ids:
+            if vehicle_id in parked_vehicle_ids.values():
+                continue
+            if vehicle_id in self._processed_completed_vehicle_ids:
+                continue
+
             session = self._active_session_by_vehicle(vehicle_id)
             if session is not None:
                 session.ended_at = now
@@ -192,6 +199,7 @@ class ParkingSessionManager:
                         (now.isoformat(), duration, fee, session.session_id),
                     )
                     conn.commit()
+                self._processed_completed_vehicle_ids.add(vehicle_id)
 
     def claim(self, session_id: str, customer_name: str) -> None:
         with get_connection() as conn:
@@ -367,6 +375,21 @@ class ParkingSessionManager:
                 """
             ).fetchall()
         return [self._row(self._session_from_row(row)) for row in rows]
+
+    def payable_session_by_vehicle(self, vehicle_id: str) -> ParkingSession | None:
+        with get_connection() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM parking_sessions
+                WHERE vehicle_id = ?
+                  AND payment_status = 'payment_pending'
+                ORDER BY ended_at DESC
+                LIMIT 1
+                """,
+                (vehicle_id.strip(),),
+            ).fetchone()
+        return self._session_from_row(row) if row else None
 
     def total_revenue(self) -> float:
         with get_connection() as conn:

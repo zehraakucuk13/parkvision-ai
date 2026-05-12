@@ -125,15 +125,19 @@ def main():
             session_manager.demo_customer_name = st.session_state.get("demo_customer_name", "")
             session_manager.demo_started_at = st.session_state.get("demo_started_at")
 
-        if st.session_state.screen == "payment":
-            render_payment_screen(session_manager)
-            return
-
         if not st.session_state.demo_user_ready:
             render_entry_gate(session_manager)
             return
 
         render_driver_session(session_manager)
+        return
+
+    if st.session_state.role == "payment":
+        if st.session_state.screen == "payment":
+            render_payment_screen(session_manager)
+            return
+
+        render_payment_lookup(session_manager)
         return
 
     if st.session_state.demo_user_ready:
@@ -261,13 +265,22 @@ def main():
 
 def render_role_login():
     st.subheader("Giriş")
-    driver_col, admin_col = st.columns(2)
+    driver_col, payment_col, admin_col = st.columns(3)
 
     with driver_col:
         st.markdown("**Sürücü Girişi**")
         if st.button("Sürücü olarak giriş yap", type="primary", use_container_width=True):
             st.session_state.role = "driver"
             st.session_state.screen = "entry"
+            st.session_state.demo_user_ready = False
+            st.session_state.pop("demo_session_id", None)
+            st.rerun()
+
+    with payment_col:
+        st.markdown("**Ödeme Yapma**")
+        if st.button("Ödeme ekranına geç", type="primary", use_container_width=True):
+            st.session_state.role = "payment"
+            st.session_state.screen = "payment_lookup"
             st.session_state.demo_user_ready = False
             st.session_state.pop("demo_session_id", None)
             st.rerun()
@@ -320,21 +333,40 @@ def render_driver_session(session_manager: ParkingSessionManager):
     st.dataframe(pd.DataFrame(detail_rows), use_container_width=True, hide_index=True)
 
     if demo_session.ended_at is None:
-        if st.button("Çıkış yap ve ödeme ekranına geç", type="primary", use_container_width=True):
-            session_manager.close_session(demo_session.session_id)
-            st.session_state.screen = "payment"
-            st.rerun()
+        st.info("Araç çıkışı görüntü işleme tarafından algılandığında ödeme kaydı oluşur.")
     elif not demo_session.paid:
-        if st.button("Ödeme ekranına git", type="primary", use_container_width=True):
-            st.session_state.screen = "payment"
-            st.rerun()
+        st.warning("Bu araç için ödeme bekleyen kayıt var. Ana ekrandaki ödeme yapma kısmından araç ID ile ödeme alınır.")
     else:
         st.success("Bu oturumun ödemesi tamamlandı.")
-        if st.button("Yeni sürücü girişi", use_container_width=True):
-            st.session_state.demo_user_ready = False
-            st.session_state.screen = "entry"
-            st.session_state.pop("demo_session_id", None)
+
+    if st.button("Yeni kullanıcı girişi", use_container_width=True):
+        st.session_state.demo_user_ready = False
+        st.session_state.screen = "entry"
+        st.session_state.pop("demo_session_id", None)
+        st.rerun()
+
+
+def render_payment_lookup(session_manager: ParkingSessionManager):
+    st.subheader("Ödeme Yapma")
+    vehicle_id = st.text_input("Ödenecek araç ID", value=st.session_state.get("payment_vehicle_id", ""))
+
+    if st.button("Ödeme kaydını bul", type="primary", use_container_width=True):
+        session = session_manager.payable_session_by_vehicle(vehicle_id)
+        if session is None:
+            st.error("Bu araç ID için ödeme bekleyen çıkış kaydı bulunamadı.")
+        else:
+            st.session_state.payment_vehicle_id = vehicle_id.strip()
+            st.session_state.demo_vehicle_id = session.vehicle_id
+            st.session_state.demo_customer_name = session.customer_name
+            st.session_state.demo_started_at = session.started_at
+            st.session_state.demo_session_id = session.session_id
+            st.session_state.screen = "payment"
             st.rerun()
+
+    payable_rows = session_manager.payable_rows()
+    if payable_rows:
+        st.markdown("**Ödeme Bekleyen Araçlar**")
+        st.dataframe(pd.DataFrame(payable_rows), use_container_width=True, hide_index=True)
 
 
 def render_entry_gate(session_manager: ParkingSessionManager):
@@ -497,9 +529,9 @@ def render_payment_screen(session_manager: ParkingSessionManager):
 
         if demo_session.paid:
             st.success("Ödeme tamamlandı. İyi yolculuklar.")
-            if st.button("Yeni kullanıcı girişi", use_container_width=True):
+            if st.button("Yeni ödeme ara", use_container_width=True):
                 st.session_state.demo_user_ready = False
-                st.session_state.screen = "entry"
+                st.session_state.screen = "payment_lookup"
                 st.session_state.pop("demo_session_id", None)
                 st.rerun()
         elif demo_session.ended_at is None:
