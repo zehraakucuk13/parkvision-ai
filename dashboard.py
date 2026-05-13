@@ -1,14 +1,16 @@
 from pathlib import Path
 from datetime import datetime, timedelta
+import hashlib
 import random
 import re
+import secrets
 import time
 
 import cv2
 import pandas as pd
 import streamlit as st
 
-from database import reset_demo_data, upsert_slots
+from database import get_connection, reset_demo_data, upsert_slots
 from detector import ParkingDetector
 from parking_sessions import ParkingSessionManager
 from vehicle_tracker import ParkingVehicleTracker
@@ -22,6 +24,130 @@ END_HOLD_SECONDS = 4
 DEFAULT_VIDEO_PATH = BASE_DIR / "samples" / "parking_1920_1080.mp4"
 DEFAULT_MASK_PATH = BASE_DIR / "mask_1920_1080.png"
 DEFAULT_SPEED = 8
+DEMO_VEHICLE_ID = "V-0077"
+ENTRY_DEMO_VEHICLE_ID = "V-0098"
+DEMO_PARKING_ID = "PARKVISION-MAIN-01"
+DEMO_PARKING_NAME = "Aras Otopark"
+DEMO_USER_NAME = "Demo Kullanıcı"
+DEMO_USER_PHONE = "555"
+DEMO_USER_PASSWORD = "1234"
+
+
+def password_hash(password: str) -> str:
+    return hashlib.sha256((password or "").encode("utf-8")).hexdigest()
+
+
+def create_user(full_name: str, phone: str, password: str) -> tuple[bool, str]:
+    clean_name = full_name.strip()
+    clean_phone = phone.strip()
+    if not clean_name or not clean_phone or len(password) < 4:
+        return False, "Ad, telefon ve en az 4 karakterli sifre girilmelidir."
+
+    with get_connection() as conn:
+        try:
+            conn.execute(
+                """
+                INSERT INTO app_users (full_name, phone, password, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (clean_name, clean_phone, password_hash(password), datetime.now().isoformat()),
+            )
+            conn.commit()
+        except Exception:
+            return False, "Bu telefon numarasi ile kayit zaten var."
+    return True, "Kayit olusturuldu."
+
+
+def authenticate_user(phone: str, password: str) -> dict | None:
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT user_id, full_name, phone
+            FROM app_users
+            WHERE phone = ? AND password = ?
+            """,
+            (phone.strip(), password_hash(password)),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def ensure_demo_user() -> dict:
+    create_user(DEMO_USER_NAME, DEMO_USER_PHONE, DEMO_USER_PASSWORD)
+    with get_connection() as conn:
+        conn.execute(
+            """
+            UPDATE app_users
+            SET full_name = ?, password = ?
+            WHERE phone = ?
+            """,
+            (DEMO_USER_NAME, password_hash(DEMO_USER_PASSWORD), DEMO_USER_PHONE),
+        )
+        conn.commit()
+    user = authenticate_user(DEMO_USER_PHONE, DEMO_USER_PASSWORD)
+    if user is None:
+        raise RuntimeError("Demo kullanıcısı oluşturulamadı.")
+    return user
+
+
+def is_demo_user(user: dict | None) -> bool:
+    return bool(user and user.get("phone") == DEMO_USER_PHONE)
+
+
+def issue_access_token(user_id: int) -> str:
+    token = f"PV-{secrets.token_urlsafe(18)}"
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO parking_access_tokens (
+                token, user_id, status, issued_at, expires_at
+            )
+            VALUES (?, ?, 'issued', ?, ?)
+            """,
+            (
+                token,
+                user_id,
+                datetime.now().isoformat(),
+                (datetime.now() + timedelta(hours=8)).isoformat(),
+            ),
+        )
+        conn.commit()
+    return token
+
+
+def activate_access_token(token: str, vehicle_id: str, session_id: str) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            """
+            UPDATE parking_access_tokens
+            SET vehicle_id = ?,
+                session_id = ?,
+                status = 'scanned',
+                scanned_at = ?
+            WHERE token = ?
+            """,
+            (vehicle_id, session_id, datetime.now().isoformat(), token),
+        )
+        conn.commit()
+
+
+def get_current_user() -> dict | None:
+    return st.session_state.get("current_user")
+
+
+def qr_payload(token: str) -> str:
+    return f"PARKVISION|parking={DEMO_PARKING_ID}|token={token}"
+
+
+def make_qr_image(payload: str):
+    try:
+        import qrcode
+    except ImportError:
+        return None
+
+    qr = qrcode.QRCode(border=2, box_size=8)
+    qr.add_data(payload)
+    qr.make(fit=True)
+    return qr.make_image(fill_color="black", back_color="white").convert("RGB")
 
 
 def normalize_card_number(card_number: str) -> str:
@@ -88,6 +214,17 @@ def get_session_manager() -> ParkingSessionManager:
     return st.session_state.parking_session_manager
 
 
+def reset_and_seed_demo(session_manager: ParkingSessionManager) -> None:
+    reset_demo_data()
+    ensure_demo_user()
+    started_at = datetime.now() - timedelta(minutes=random.randint(70, 125))
+    st.session_state.default_entry_time = started_at
+    session_manager.demo_vehicle_id = DEMO_VEHICLE_ID
+    session_manager.demo_customer_name = DEMO_USER_NAME
+    session_manager.demo_started_at = started_at
+    session_manager.start_demo_session(DEMO_VEHICLE_ID, DEMO_USER_NAME, started_at)
+
+
 def main():
     st.set_page_config(page_title="ParkVision AI", layout="wide")
     inject_theme()
@@ -97,16 +234,13 @@ def main():
     st.session_state.setdefault("demo_user_ready", False)
     st.session_state.setdefault("role", None)
     st.session_state.setdefault("screen", "role_login")
-    if "demo_db_reset_done" not in st.session_state:
-        reset_demo_data()
-        st.session_state.demo_db_reset_done = True
     if "default_entry_time" not in st.session_state:
         st.session_state.default_entry_time = datetime.now() - timedelta(minutes=random.randint(35, 125))
 
     session_manager = get_session_manager()
 
     if st.session_state.role is None:
-        render_role_login()
+        render_app_login()
         return
 
     with st.sidebar:
@@ -203,7 +337,7 @@ def render_tracking_video(session_manager: ParkingSessionManager):
         if not ok:
             vehicle_tracker.complete_exiting_tracks()
             if last_annotated is not None:
-                frame_slot.image(last_annotated, channels="RGB", use_container_width=True)
+                frame_slot.image(last_annotated, channels="RGB", use_column_width=True)
             render_side_panel(last_statuses)
             st.info("Video bitti.")
             time.sleep(END_HOLD_SECONDS)
@@ -221,7 +355,7 @@ def render_tracking_video(session_manager: ParkingSessionManager):
             annotated = cv2.resize(annotated, (DISPLAY_WIDTH, display_height), interpolation=cv2.INTER_AREA)
 
         last_annotated = annotated
-        frame_slot.image(annotated, channels="RGB", use_container_width=True)
+        frame_slot.image(annotated, channels="RGB", use_column_width=True)
 
         if frame_index % PANEL_UPDATE_EVERY_FRAMES == 0:
             render_side_panel(statuses)
@@ -231,7 +365,7 @@ def render_tracking_video(session_manager: ParkingSessionManager):
             if not ok:
                 vehicle_tracker.complete_exiting_tracks()
                 if last_annotated is not None:
-                    frame_slot.image(last_annotated, channels="RGB", use_container_width=True)
+                    frame_slot.image(last_annotated, channels="RGB", use_column_width=True)
                 render_side_panel(last_statuses)
                 st.info("Video bitti.")
                 time.sleep(END_HOLD_SECONDS)
@@ -585,6 +719,373 @@ def render_payment_screen(session_manager: ParkingSessionManager):
     if st.button("Genel bakışa dön"):
         st.session_state.screen = "main"
         st.rerun()
+
+
+def render_app_login():
+    st.subheader("ParkVision Mobil")
+    st.caption("Giriş yapın, yeni hesap oluşturun veya Aras Otopark ekranını açın.")
+
+    login_col, register_col, parking_col = st.columns(3)
+
+    with login_col:
+        st.markdown("**Giriş yap**")
+        with st.form("driver_login_form"):
+            phone = st.text_input("Telefon", key="login_phone")
+            password = st.text_input("Şifre", type="password", key="login_password")
+            submitted = st.form_submit_button("Giriş yap", type="primary", use_container_width=True)
+
+        if submitted:
+            user = authenticate_user(phone, password)
+            if user is None:
+                st.error("Telefon veya şifre hatalı.")
+            else:
+                st.session_state.current_user = user
+                st.session_state.role = "driver"
+                st.session_state.screen = "entry"
+                st.session_state.demo_user_ready = False
+                st.session_state.pop("qr_token", None)
+                st.rerun()
+
+    with register_col:
+        st.markdown("**Kayıt ol**")
+        with st.form("driver_register_form"):
+            full_name = st.text_input("Ad soyad")
+            phone = st.text_input("Telefon", key="register_phone")
+            password = st.text_input("Şifre", type="password", key="register_password")
+            submitted = st.form_submit_button("Kayıt ol", use_container_width=True)
+
+        if submitted:
+            ok, message = create_user(full_name, phone, password)
+            if ok:
+                user = authenticate_user(phone, password)
+                st.session_state.current_user = user
+                st.session_state.role = "driver"
+                st.session_state.screen = "entry"
+                st.session_state.demo_user_ready = False
+                st.session_state.pop("qr_token", None)
+                st.success(message)
+                st.rerun()
+            else:
+                st.error(message)
+
+    with parking_col:
+        st.markdown("**Otopark Girişi**")
+        with st.form("parking_login_form"):
+            parking_name = st.text_input("Otopark adı", value=DEMO_PARKING_NAME)
+            submitted = st.form_submit_button("Otoparkı aç", use_container_width=True)
+
+        if submitted:
+            if parking_name.strip().lower() != DEMO_PARKING_NAME.lower():
+                st.error("Bu demoda yalnızca Aras Otopark kullanılabilir.")
+            else:
+                st.session_state.role = "parking"
+                st.session_state.screen = "main"
+                st.session_state.parking_name = DEMO_PARKING_NAME
+                st.session_state.demo_user_ready = False
+                st.session_state.pop("qr_token", None)
+                st.session_state.pop("current_user", None)
+                st.session_state.pop("demo_session_id", None)
+                st.rerun()
+
+
+def render_entry_gate(session_manager: ParkingSessionManager):
+    current_user = get_current_user()
+    if current_user is None:
+        st.session_state.role = None
+        st.rerun()
+
+    st.subheader("Parking Entry")
+    st.caption("A single entrance gate is assumed. Scan this QR at the gate; the first detected vehicle receives your ID.")
+
+    history_rows = [
+        row
+        for row in session_manager.rows()
+        if row.get("MÃ¼ÅŸteri") == current_user["full_name"] or row.get("Musteri") == current_user["full_name"]
+    ]
+    if history_rows:
+        st.markdown("**Previous parking records**")
+        st.dataframe(pd.DataFrame(history_rows), use_container_width=True, hide_index=True)
+    else:
+        st.info("No previous parking record for this account yet.")
+
+    if "qr_token" not in st.session_state:
+        st.session_state.qr_token = issue_access_token(current_user["user_id"])
+
+    token = st.session_state.qr_token
+    payload = qr_payload(token)
+    qr_col, info_col = st.columns([0.9, 1.1])
+    with qr_col:
+        st.markdown("**Gate QR**")
+        qr_image = make_qr_image(payload)
+        if qr_image is None:
+            st.warning("QR package is not installed yet. Run: pip install qrcode[pil]")
+            st.code(payload, language="text")
+        else:
+            st.image(qr_image, width=260)
+    with info_col:
+        st.metric("Parking lot", DEMO_PARKING_ID)
+        st.metric("QR status", "Waiting for gate scan")
+        st.write("This QR belongs to your account and remains valid until this parking session ends.")
+
+    if st.button("Simulate QR scan at entrance gate", type="primary", use_container_width=True):
+        started_at = st.session_state.default_entry_time
+        vehicle_id = DEMO_VEHICLE_ID
+        st.session_state.demo_vehicle_id = vehicle_id
+        st.session_state.demo_customer_name = current_user["full_name"]
+        st.session_state.demo_started_at = started_at
+        st.session_state.demo_user_ready = True
+        st.session_state.screen = "main"
+        demo_session = session_manager.start_demo_session(vehicle_id, current_user["full_name"], started_at)
+        st.session_state.demo_session_id = demo_session.session_id
+        activate_access_token(token, vehicle_id, demo_session.session_id)
+        st.rerun()
+
+
+def render_parking_lot_screen(session_manager: ParkingSessionManager):
+    st.subheader("Live Parking Session")
+    if st.session_state.screen == "payment":
+        render_payment_screen(session_manager)
+        return
+
+    render_tracking_video(session_manager)
+
+    demo_session = session_manager.get_by_session_id(st.session_state.get("demo_session_id", ""))
+    if demo_session is not None and demo_session.ended_at is not None and not demo_session.paid:
+        st.success("Exit detected. Redirecting to payment screen.")
+        st.session_state.screen = "payment"
+        st.rerun()
+
+    if st.session_state.screen == "payment":
+        render_payment_screen(session_manager)
+    else:
+        render_driver_session(session_manager)
+
+
+def main():
+    st.set_page_config(page_title="ParkVision AI", layout="wide")
+    inject_theme()
+    st.title("ParkVision AI")
+
+    st.session_state.setdefault("demo_finished", False)
+    st.session_state.setdefault("demo_user_ready", False)
+    st.session_state.setdefault("role", None)
+    st.session_state.setdefault("screen", "role_login")
+    if "default_entry_time" not in st.session_state:
+        st.session_state.default_entry_time = datetime.now() - timedelta(minutes=random.randint(35, 125))
+
+    session_manager = get_session_manager()
+
+    if st.session_state.role is None:
+        render_app_login()
+        return
+
+    if st.session_state.role == "parking":
+        with st.sidebar:
+            st.caption(DEMO_PARKING_NAME)
+            if st.button("Ana ekrana dön", use_container_width=True):
+                st.session_state.role = None
+                st.session_state.screen = "role_login"
+                st.rerun()
+        render_public_parking_screen(session_manager)
+        return
+
+    with st.sidebar:
+        current_user = get_current_user()
+        if current_user:
+            st.caption(f"User: {current_user['full_name']}")
+        if st.button("Sign out", use_container_width=True):
+            st.session_state.role = None
+            st.session_state.screen = "role_login"
+            st.session_state.demo_user_ready = False
+            st.session_state.pop("current_user", None)
+            st.session_state.pop("qr_token", None)
+            st.session_state.pop("demo_session_id", None)
+            st.rerun()
+
+    if not st.session_state.demo_user_ready:
+        render_entry_gate(session_manager)
+        return
+
+    render_parking_lot_screen(session_manager)
+
+
+def render_entry_gate(session_manager: ParkingSessionManager):
+    current_user = get_current_user()
+    if current_user is None:
+        st.session_state.role = None
+        st.rerun()
+
+    st.subheader("Otopark Girişi")
+    st.caption("Demo otopark: Aras Otopark. Sistem tek girişli otopark varsayımıyla çalışır.")
+
+    history_rows = [
+        row for row in session_manager.rows()
+        if row.get("Müşteri") == current_user["full_name"]
+    ]
+    if history_rows:
+        st.markdown("**Geçmiş otopark kayıtlarım**")
+        st.dataframe(pd.DataFrame(history_rows), use_container_width=True, hide_index=True)
+    else:
+        st.info("Bu kullanıcı için henüz geçmiş otopark kaydı yok.")
+
+    parking_name = st.text_input("Otopark adı", value=st.session_state.get("parking_name", DEMO_PARKING_NAME))
+    st.session_state.parking_name = parking_name
+    if parking_name.strip().lower() != DEMO_PARKING_NAME.lower():
+        st.warning("Bu demoda yalnızca Aras Otopark kullanılabilir.")
+        return
+
+    st.markdown("**Aras Otopark fiyat listesi**")
+    st.dataframe(pd.DataFrame(session_manager.tariff_rows()), use_container_width=True, hide_index=True)
+
+    if is_demo_user(current_user):
+        session_manager.demo_vehicle_id = DEMO_VEHICLE_ID
+        session_manager.demo_customer_name = DEMO_USER_NAME
+        session_manager.demo_started_at = st.session_state.default_entry_time
+        demo_session = session_manager.ensure_demo_session()
+        st.session_state.demo_vehicle_id = DEMO_VEHICLE_ID
+        st.session_state.demo_customer_name = DEMO_USER_NAME
+        st.session_state.demo_started_at = demo_session.started_at
+        st.session_state.demo_session_id = demo_session.session_id
+        st.session_state.demo_user_ready = True
+        st.session_state.screen = "main"
+        st.rerun()
+        return
+        st.info("V-0077 bu demoda daha önce otoparka giriş yapmış kabul edilir. Bu yüzden tekrar QR gösterilmez.")
+        if st.button("Aras Otopark ekranını aç", type="primary", use_container_width=True):
+            session_manager.demo_vehicle_id = DEMO_VEHICLE_ID
+            session_manager.demo_customer_name = DEMO_USER_NAME
+            session_manager.demo_started_at = st.session_state.default_entry_time
+            demo_session = session_manager.ensure_demo_session()
+            st.session_state.demo_vehicle_id = DEMO_VEHICLE_ID
+            st.session_state.demo_customer_name = DEMO_USER_NAME
+            st.session_state.demo_started_at = demo_session.started_at
+            st.session_state.demo_session_id = demo_session.session_id
+            st.session_state.demo_user_ready = True
+            st.session_state.screen = "main"
+            st.rerun()
+        return
+
+    if "qr_token" not in st.session_state:
+        st.session_state.qr_token = issue_access_token(current_user["user_id"])
+
+    token = st.session_state.qr_token
+    payload = qr_payload(token)
+    qr_col, info_col = st.columns([0.9, 1.1])
+    with qr_col:
+        st.markdown("**Giriş QR kodu**")
+        qr_image = make_qr_image(payload)
+        if qr_image is None:
+            st.warning("QR paketi kurulu değil. Komut: pip install qrcode[pil]")
+            st.code(payload, language="text")
+        else:
+            st.image(qr_image, width=260)
+    with info_col:
+        st.metric("Otopark", DEMO_PARKING_NAME)
+        st.metric("Atanacak araç ID", ENTRY_DEMO_VEHICLE_ID)
+        st.write("Bu QR yeni giriş demosu içindir. Video bu aracı göstermediği için oturum kayıtlarına eklenmez.")
+
+    if st.button("QR cihazda okutuldu", type="primary", use_container_width=True):
+        activate_access_token(token, ENTRY_DEMO_VEHICLE_ID, "")
+        st.session_state.entry_demo_scanned = True
+        st.session_state.demo_vehicle_id = ENTRY_DEMO_VEHICLE_ID
+        st.session_state.demo_customer_name = current_user["full_name"]
+        st.session_state.demo_user_ready = True
+        st.session_state.screen = "main"
+        st.rerun()
+
+    if st.session_state.get("entry_demo_scanned"):
+        st.success(f"QR okundu. Tek girişli otoparkta yeni giren araca {ENTRY_DEMO_VEHICLE_ID} atanır.")
+
+
+def render_parking_lot_records(session_manager: ParkingSessionManager):
+    st.markdown("**Aras Otopark kayıtları**")
+    rows = session_manager.rows()
+    if rows:
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    else:
+        st.info("Henüz otopark kaydı yok.")
+
+    st.markdown("**Aras Otopark fiyat listesi**")
+    st.dataframe(pd.DataFrame(session_manager.tariff_rows()), use_container_width=True, hide_index=True)
+
+
+def render_parking_lot_screen(session_manager: ParkingSessionManager):
+    st.subheader(DEMO_PARKING_NAME)
+    if st.session_state.screen == "payment":
+        render_payment_screen(session_manager)
+        return
+
+    render_tracking_video(session_manager)
+
+    demo_session = session_manager.get_by_session_id(st.session_state.get("demo_session_id", ""))
+    if demo_session is not None and demo_session.ended_at is not None and not demo_session.paid:
+        st.success("Araç çıkışı algılandı. Ödeme ekranına yönlendiriliyor.")
+        st.session_state.screen = "payment"
+        st.rerun()
+
+    if demo_session is None:
+        st.info(f"{ENTRY_DEMO_VEHICLE_ID} giriş demosu: QR okutuldu, canlı otopark ekranı açıldı. Video bu aracı içermediği için kayıt oluşturulmadı.")
+    else:
+        render_driver_session(session_manager)
+    render_parking_lot_records(session_manager)
+
+
+def render_public_parking_screen(session_manager: ParkingSessionManager):
+    st.subheader(DEMO_PARKING_NAME)
+    render_tracking_video(session_manager)
+    render_parking_lot_records(session_manager)
+
+
+def main():
+    st.set_page_config(page_title="ParkVision AI", layout="wide")
+    inject_theme()
+    st.title("ParkVision AI")
+
+    st.session_state.setdefault("demo_finished", False)
+    st.session_state.setdefault("demo_user_ready", False)
+    st.session_state.setdefault("role", None)
+    st.session_state.setdefault("screen", "role_login")
+
+    session_manager = get_session_manager()
+    if "demo_db_reset_done" not in st.session_state:
+        reset_and_seed_demo(session_manager)
+        st.session_state.demo_db_reset_done = True
+    if "default_entry_time" not in st.session_state:
+        st.session_state.default_entry_time = datetime.now() - timedelta(minutes=random.randint(70, 125))
+
+    if st.session_state.role is None:
+        render_app_login()
+        return
+
+    if st.session_state.role == "parking":
+        with st.sidebar:
+            st.caption(DEMO_PARKING_NAME)
+            if st.button("Ana ekrana dön", use_container_width=True):
+                st.session_state.role = None
+                st.session_state.screen = "role_login"
+                st.rerun()
+        render_public_parking_screen(session_manager)
+        return
+
+    with st.sidebar:
+        current_user = get_current_user()
+        if current_user:
+            st.caption(f"Kullanıcı: {current_user['full_name']}")
+        if st.button("Çıkış yap", use_container_width=True):
+            st.session_state.role = None
+            st.session_state.screen = "role_login"
+            st.session_state.demo_user_ready = False
+            st.session_state.pop("current_user", None)
+            st.session_state.pop("qr_token", None)
+            st.session_state.pop("demo_session_id", None)
+            st.session_state.pop("entry_demo_scanned", None)
+            st.rerun()
+
+    if not st.session_state.demo_user_ready:
+        render_entry_gate(session_manager)
+        return
+
+    render_parking_lot_screen(session_manager)
 
 
 def inject_theme():
