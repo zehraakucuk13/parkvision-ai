@@ -757,14 +757,7 @@ def render_app_login():
         if submitted:
             ok, message = create_user(full_name, phone, password)
             if ok:
-                user = authenticate_user(phone, password)
-                st.session_state.current_user = user
-                st.session_state.role = "driver"
-                st.session_state.screen = "entry"
-                st.session_state.demo_user_ready = False
-                st.session_state.pop("qr_token", None)
-                st.success(message)
-                st.rerun()
+                st.success("Kayıt oluşturuldu. Şimdi Giriş yap bölümünden telefon ve şifrenizle giriş yapabilirsiniz.")
             else:
                 st.error(message)
 
@@ -995,6 +988,66 @@ def render_entry_gate(session_manager: ParkingSessionManager):
 
     if st.session_state.get("entry_demo_scanned"):
         st.success(f"QR okundu. Tek girişli otoparkta yeni giren araca {ENTRY_DEMO_VEHICLE_ID} atanır.")
+
+
+def render_entry_gate(session_manager: ParkingSessionManager):
+    current_user = get_current_user()
+    if current_user is None:
+        st.session_state.role = None
+        st.rerun()
+
+    if is_demo_user(current_user):
+        session_manager.demo_vehicle_id = DEMO_VEHICLE_ID
+        session_manager.demo_customer_name = DEMO_USER_NAME
+        session_manager.demo_started_at = st.session_state.default_entry_time
+        demo_session = session_manager.ensure_demo_session()
+        st.session_state.demo_vehicle_id = DEMO_VEHICLE_ID
+        st.session_state.demo_customer_name = DEMO_USER_NAME
+        st.session_state.demo_started_at = demo_session.started_at
+        st.session_state.demo_session_id = demo_session.session_id
+        st.session_state.demo_user_ready = True
+        st.session_state.screen = "main"
+        st.rerun()
+
+    st.subheader("QR Girişi")
+    st.caption("Otopark giriş cihazındaki QR okutulmadan otopark ve araç bilgisi gösterilmez.")
+
+    history_rows = [
+        row for row in session_manager.rows()
+        if row.get("Müşteri") == current_user["full_name"]
+    ]
+    if history_rows:
+        st.markdown("**Geçmiş otopark kayıtlarım**")
+        st.dataframe(pd.DataFrame(history_rows), use_container_width=True, hide_index=True)
+    else:
+        st.info("Bu kullanıcı için henüz geçmiş otopark kaydı yok.")
+
+    if "qr_token" not in st.session_state:
+        st.session_state.qr_token = issue_access_token(current_user["user_id"])
+
+    token = st.session_state.qr_token
+    payload = qr_payload(token)
+    qr_col, info_col = st.columns([0.9, 1.1])
+    with qr_col:
+        st.markdown("**Giriş QR kodu**")
+        qr_image = make_qr_image(payload)
+        if qr_image is None:
+            st.warning("QR paketi kurulu değil. Komut: pip install qrcode[pil]")
+            st.code(payload, language="text")
+        else:
+            st.image(qr_image, width=260)
+    with info_col:
+        st.write("Bu QR kodu otopark giriş cihazına okutun.")
+        st.write("QR okutulduktan sonra otopark adı ve atanacak araç ID bilgisi gösterilecektir.")
+
+    if st.button("QR cihazda okutuldu", type="primary", use_container_width=True):
+        activate_access_token(token, ENTRY_DEMO_VEHICLE_ID, "")
+        st.session_state.entry_demo_scanned = True
+        st.session_state.demo_vehicle_id = ENTRY_DEMO_VEHICLE_ID
+        st.session_state.demo_customer_name = current_user["full_name"]
+        st.session_state.demo_user_ready = True
+        st.session_state.screen = "main"
+        st.rerun()
 
 
 def render_parking_lot_records(session_manager: ParkingSessionManager):
